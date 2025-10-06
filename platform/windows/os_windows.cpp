@@ -46,9 +46,9 @@
 #include "drivers/windows/net_socket_winsock.h"
 #include "drivers/windows/thread_windows.h"
 #include "main/main.h"
-#include "servers/audio_server.h"
+#include "servers/audio/audio_server.h"
 #include "servers/rendering/rendering_server_default.h"
-#include "servers/text_server.h"
+#include "servers/text/text_server.h"
 
 #include <avrt.h>
 #include <bcrypt.h>
@@ -851,7 +851,7 @@ bool OS_Windows::get_user_prefers_integrated_gpu() const {
 			GetCurrentApplicationUserModelIdPtr GetCurrentApplicationUserModelId = (GetCurrentApplicationUserModelIdPtr)(void *)GetProcAddress(kernel32, "GetCurrentApplicationUserModelId");
 
 			if (GetCurrentApplicationUserModelId) {
-				UINT32 length = std::size(value_name);
+				UINT32 length = std_size(value_name);
 				LONG result = GetCurrentApplicationUserModelId(&length, value_name);
 				if (result == ERROR_SUCCESS) {
 					is_packaged = true;
