@@ -39,8 +39,13 @@ void EditorDock::_set_default_slot_bind(EditorPlugin::DockSlot p_slot) {
 	default_slot = (DockConstants::DockSlot)p_slot;
 }
 
+void EditorDock::_emit_changed() {
+	emit_signal(SNAME("_tab_style_changed"));
+}
+
 void EditorDock::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("open"), &EditorDock::open);
+	ClassDB::bind_method(D_METHOD("make_visible"), &EditorDock::make_visible);
 	ClassDB::bind_method(D_METHOD("close"), &EditorDock::close);
 
 	ClassDB::bind_method(D_METHOD("set_title", "title"), &EditorDock::set_title);
@@ -59,6 +64,10 @@ void EditorDock::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("is_transient"), &EditorDock::is_transient);
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "transient"), "set_transient", "is_transient");
 
+	ClassDB::bind_method(D_METHOD("set_closable", "closable"), &EditorDock::set_closable);
+	ClassDB::bind_method(D_METHOD("is_closable"), &EditorDock::is_closable);
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "closable"), "set_closable", "is_closable");
+
 	ClassDB::bind_method(D_METHOD("set_icon_name", "icon_name"), &EditorDock::set_icon_name);
 	ClassDB::bind_method(D_METHOD("get_icon_name"), &EditorDock::get_icon_name);
 	ADD_PROPERTY(PropertyInfo(Variant::STRING_NAME, "icon_name"), "set_icon_name", "get_icon_name");
@@ -66,6 +75,10 @@ void EditorDock::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_dock_icon", "icon"), &EditorDock::set_dock_icon);
 	ClassDB::bind_method(D_METHOD("get_dock_icon"), &EditorDock::get_dock_icon);
 	ADD_PROPERTY(PropertyInfo(Variant::OBJECT, "dock_icon", PROPERTY_HINT_RESOURCE_TYPE, "Texture2D"), "set_dock_icon", "get_dock_icon");
+
+	ClassDB::bind_method(D_METHOD("set_force_show_icon", "force"), &EditorDock::set_force_show_icon);
+	ClassDB::bind_method(D_METHOD("get_force_show_icon"), &EditorDock::get_force_show_icon);
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "force_show_icon"), "set_force_show_icon", "get_force_show_icon");
 
 	ClassDB::bind_method(D_METHOD("set_title_color", "color"), &EditorDock::set_title_color);
 	ClassDB::bind_method(D_METHOD("get_title_color"), &EditorDock::get_title_color);
@@ -77,11 +90,14 @@ void EditorDock::_bind_methods() {
 
 	ClassDB::bind_method(D_METHOD("set_default_slot", "slot"), &EditorDock::_set_default_slot_bind);
 	ClassDB::bind_method(D_METHOD("get_default_slot"), &EditorDock::_get_default_slot_bind);
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "default_slot"), "set_default_slot", "get_default_slot");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "default_slot", PROPERTY_HINT_ENUM, "None:-1,Left Side Upper-Left,Left Side Bottom-Left,Left Side Upper-Right,Left Side Bottom-Right,Right Side Upper-Left,Right Side Bottom-Left,Right Side Upper-Right,Right Side Bottom-Right,Bottom"), "set_default_slot", "get_default_slot");
 
 	ClassDB::bind_method(D_METHOD("set_available_layouts", "layouts"), &EditorDock::set_available_layouts);
 	ClassDB::bind_method(D_METHOD("get_available_layouts"), &EditorDock::get_available_layouts);
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "available_layouts", PROPERTY_HINT_FLAGS, "Vertical:1,Horizontal:2,Floating:3"), "set_available_layouts", "get_available_layouts");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "available_layouts", PROPERTY_HINT_FLAGS, "Vertical:1,Horizontal:2,Floating:4"), "set_available_layouts", "get_available_layouts");
+
+	ADD_SIGNAL(MethodInfo("closed"));
+	ADD_SIGNAL(MethodInfo("_tab_style_changed"));
 
 	BIND_BITFIELD_FLAG(DOCK_LAYOUT_VERTICAL);
 	BIND_BITFIELD_FLAG(DOCK_LAYOUT_HORIZONTAL);
@@ -93,15 +109,14 @@ void EditorDock::_bind_methods() {
 	GDVIRTUAL_BIND(_load_layout_from_config, "config", "section");
 }
 
-EditorDock::EditorDock() {
-	set_clip_contents(true);
-	add_user_signal(MethodInfo("tab_style_changed"));
-}
-
 void EditorDock::open() {
 	if (!is_open) {
-		EditorDockManager::get_singleton()->open_dock(this);
+		EditorDockManager::get_singleton()->open_dock(this, false);
 	}
+}
+
+void EditorDock::make_visible() {
+	EditorDockManager::get_singleton()->focus_dock(this);
 }
 
 void EditorDock::close() {
@@ -115,7 +130,7 @@ void EditorDock::set_title(const String &p_title) {
 		return;
 	}
 	title = p_title;
-	emit_signal("tab_style_changed");
+	_emit_changed();
 }
 
 void EditorDock::set_global(bool p_global) {
@@ -133,7 +148,7 @@ void EditorDock::set_icon_name(const StringName &p_name) {
 		return;
 	}
 	icon_name = p_name;
-	emit_signal("tab_style_changed");
+	_emit_changed();
 }
 
 void EditorDock::set_dock_icon(const Ref<Texture2D> &p_icon) {
@@ -141,7 +156,15 @@ void EditorDock::set_dock_icon(const Ref<Texture2D> &p_icon) {
 		return;
 	}
 	dock_icon = p_icon;
-	emit_signal("tab_style_changed");
+	_emit_changed();
+}
+
+void EditorDock::set_force_show_icon(bool p_force) {
+	if (force_show_icon == p_force) {
+		return;
+	}
+	force_show_icon = p_force;
+	_emit_changed();
 }
 
 void EditorDock::set_title_color(const Color &p_color) {
@@ -149,7 +172,7 @@ void EditorDock::set_title_color(const Color &p_color) {
 		return;
 	}
 	title_color = p_color;
-	emit_signal("tab_style_changed");
+	_emit_changed();
 }
 
 void EditorDock::set_dock_shortcut(const Ref<Shortcut> &p_shortcut) {

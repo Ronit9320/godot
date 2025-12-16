@@ -298,7 +298,7 @@ void EditorDockManager::_dock_container_popup(int p_tab_idx, TabContainer *p_doc
 
 	// Right click context menu.
 	dock_context_popup->set_dock(hovered_dock);
-	dock_context_popup->set_position(p_dock_container->get_tab_bar()->get_screen_position() + p_dock_container->get_local_mouse_position());
+	dock_context_popup->set_position(p_dock_container->get_tab_bar()->get_screen_position() + p_dock_container->get_tab_bar()->get_local_mouse_position());
 	dock_context_popup->popup();
 }
 
@@ -333,7 +333,7 @@ void EditorDockManager::update_docks_menu() {
 	// Add docks.
 	docks_menu_docks.clear();
 	int id = 0;
-	const Callable icon_fetch = callable_mp((Window *)docks_menu, &Window::get_editor_theme_native_menu_icon).bind(global_menu, dark_mode);
+	const Callable icon_fetch = callable_mp(EditorNode::get_singleton(), &EditorNode::get_editor_theme_native_menu_icon).bind(global_menu, dark_mode);
 	for (EditorDock *dock : all_docks) {
 		if (!dock->enabled || !dock->global) {
 			continue;
@@ -406,7 +406,7 @@ void EditorDockManager::_open_dock_in_window(EditorDock *p_dock, bool p_show_win
 	Point2 dock_screen_pos = p_dock->get_screen_position();
 
 	WindowWrapper *wrapper = memnew(WindowWrapper);
-	wrapper->set_window_title(vformat(TTR("%s - Godot Engine"), p_dock->get_display_title()));
+	wrapper->set_window_title(vformat(TTR("%s - Godot Engine"), TTR(p_dock->get_display_title())));
 	wrapper->set_margins_enabled(true);
 
 	EditorNode::get_singleton()->get_gui_base()->add_child(wrapper);
@@ -520,6 +520,26 @@ void EditorDockManager::_move_dock(EditorDock *p_dock, Control *p_target, int p_
 	}
 }
 
+void EditorDockManager::_queue_update_tab_style(EditorDock *p_dock) {
+	if (dirty_docks.is_empty()) {
+		callable_mp(this, &EditorDockManager::_update_dirty_dock_tabs).call_deferred();
+	}
+	dirty_docks.insert(p_dock);
+}
+
+void EditorDockManager::_update_dirty_dock_tabs() {
+	bool update_menu = false;
+	for (EditorDock *dock : dirty_docks) {
+		update_menu = update_menu || dock->global;
+		_update_tab_style(dock);
+	}
+	dirty_docks.clear();
+
+	if (update_menu) {
+		update_docks_menu();
+	}
+}
+
 void EditorDockManager::_update_tab_style(EditorDock *p_dock) {
 	if (!p_dock->enabled || !p_dock->is_open) {
 		return; // Disabled by feature profile or manually closed by user.
@@ -534,30 +554,39 @@ void EditorDockManager::_update_tab_style(EditorDock *p_dock) {
 	int index = tab_container->get_tab_idx_from_control(p_dock);
 	ERR_FAIL_COND(index == -1);
 
-	if (p_dock->global) {
-		update_docks_menu();
-	}
-
 	tab_container->get_tab_bar()->set_font_color_override_all(index, p_dock->title_color);
 
-	const TabStyle style = (TabStyle)EDITOR_GET("interface/editor/dock_tab_style").operator int();
+	const TabStyle style = (tab_container == EditorNode::get_bottom_panel())
+			? (TabStyle)EDITOR_GET("interface/editor/bottom_dock_tab_style").operator int()
+			: (TabStyle)EDITOR_GET("interface/editor/dock_tab_style").operator int();
+
 	const Ref<Texture2D> icon = _get_dock_icon(p_dock, callable_mp((Control *)tab_container, &Control::get_editor_theme_icon));
+	bool assign_icon = p_dock->force_show_icon;
+	String tooltip;
 	switch (style) {
 		case TabStyle::TEXT_ONLY: {
 			tab_container->set_tab_title(index, p_dock->get_display_title());
-			tab_container->set_tab_icon(index, Ref<Texture2D>());
-			tab_container->set_tab_tooltip(index, String());
 		} break;
 		case TabStyle::ICON_ONLY: {
 			tab_container->set_tab_title(index, icon.is_valid() ? String() : p_dock->get_display_title());
-			tab_container->set_tab_icon(index, icon);
-			tab_container->set_tab_tooltip(index, p_dock->get_display_title());
+			tooltip = TTR(p_dock->get_display_title());
+			assign_icon = true;
 		} break;
 		case TabStyle::TEXT_AND_ICON: {
 			tab_container->set_tab_title(index, p_dock->get_display_title());
-			tab_container->set_tab_icon(index, icon);
-			tab_container->set_tab_tooltip(index, String());
+			assign_icon = true;
 		} break;
+	}
+
+	if (p_dock->shortcut.is_valid() && p_dock->shortcut->has_valid_event()) {
+		tooltip += (tooltip.is_empty() ? "" : "\n") + TTR(p_dock->shortcut->get_name()) + " (" + p_dock->shortcut->get_as_text() + ")";
+	}
+	tab_container->set_tab_tooltip(index, tooltip);
+
+	if (assign_icon) {
+		tab_container->set_tab_icon(index, icon);
+	} else {
+		tab_container->set_tab_icon(index, Ref<Texture2D>());
 	}
 }
 
@@ -592,6 +621,13 @@ void EditorDockManager::save_docks_to_config(Ref<ConfigFile> p_layout, const Str
 		}
 	}
 
+	// Clear the special dock slot for docks without default slots (index -1 = dock_0).
+	// This prevents closed docks from being infinitely appended to the config on each save.
+	const String no_slot_config_key = "dock_0";
+	if (p_layout->has_section_key(p_section, no_slot_config_key)) {
+		p_layout->erase_section_key(p_section, no_slot_config_key);
+	}
+
 	// Save docks in windows.
 	Dictionary floating_docks_dump;
 	for (WindowWrapper *wrapper : dock_windows) {
@@ -605,7 +641,9 @@ void EditorDockManager::save_docks_to_config(Ref<ConfigFile> p_layout, const Str
 		window_dump["window_screen_rect"] = DisplayServer::get_singleton()->screen_get_usable_rect(screen);
 
 		String name = dock->get_effective_layout_key();
-		floating_docks_dump[name] = window_dump;
+		if (!dock->transient) {
+			floating_docks_dump[name] = window_dump;
+		}
 
 		// Append to regular dock section so we know where to restore it to.
 		int dock_slot_id = dock->dock_slot_index;
@@ -656,8 +694,15 @@ void EditorDockManager::save_docks_to_config(Ref<ConfigFile> p_layout, const Str
 		}
 	}
 
-	for (int i = 0; i < hsplits.size(); i++) {
-		p_layout->set_value(p_section, "dock_hsplit_" + itos(i + 1), int(hsplits[i]->get_split_offset() / EDSCALE));
+	PackedInt32Array split_offsets = main_hsplit->get_split_offsets();
+	int index = 0;
+	for (int i = 0; i < vsplits.size(); i++) {
+		int value = 0;
+		if (vsplits[i]->is_visible() && index < split_offsets.size()) {
+			value = split_offsets[index] / EDSCALE;
+			index++;
+		}
+		p_layout->set_value(p_section, "dock_hsplit_" + itos(i + 1), value);
 	}
 }
 
@@ -695,27 +740,21 @@ void EditorDockManager::load_docks_from_config(Ref<ConfigFile> p_layout, const S
 				dock->load_layout_from_config(p_layout, section_name);
 				continue;
 			}
+
 			if (allow_floating_docks && floating_docks_dump.has(name)) {
 				_restore_dock_to_saved_window(dock, floating_docks_dump[name]);
-			} else if (i >= 0) {
-				if (dock->transient && !dock->is_open) {
-					dock->dock_slot_index = i;
+			} else if (i >= 0 && !(dock->transient && !dock->is_open)) {
+				// Safe to include transient open docks here because they won't be in the closed dock dump.
+				if (closed_docks.has(name)) {
+					dock->is_open = false;
+					dock->hide();
+					_move_dock(dock, closed_dock_parent);
 				} else {
+					dock->is_open = true;
 					_move_dock(dock, dock_slots[i].container, 0);
 				}
 			}
 			dock->load_layout_from_config(p_layout, section_name);
-
-			if (!dock->transient) {
-				if (closed_docks.has(name)) {
-					_move_dock(dock, closed_dock_parent);
-					dock->is_open = false;
-					dock->hide();
-				} else {
-					dock->is_open = true;
-					dock->show();
-				}
-			}
 
 			dock->dock_slot_index = i;
 			dock->previous_tab_index = i >= 0 ? j : 0;
@@ -744,21 +783,22 @@ void EditorDockManager::load_docks_from_config(Ref<ConfigFile> p_layout, const S
 	}
 
 	// Load SplitContainer offsets.
+	PackedInt32Array offsets;
 	for (int i = 0; i < vsplits.size(); i++) {
 		if (!p_layout->has_section_key(p_section, "dock_split_" + itos(i + 1))) {
 			continue;
 		}
 		int ofs = p_layout->get_value(p_section, "dock_split_" + itos(i + 1));
 		vsplits[i]->set_split_offset(ofs);
-	}
 
-	for (int i = 0; i < hsplits.size(); i++) {
-		if (!p_layout->has_section_key(p_section, "dock_hsplit_" + itos(i + 1))) {
-			continue;
+		// Only visible ones need a split offset for the main hsplit, even though they all have a value saved.
+		if (vsplits[i]->is_visible() && p_layout->has_section_key(p_section, "dock_hsplit_" + itos(i + 1))) {
+			int offset = p_layout->get_value(p_section, "dock_hsplit_" + itos(i + 1));
+			offsets.push_back(offset * EDSCALE);
 		}
-		int ofs = p_layout->get_value(p_section, "dock_hsplit_" + itos(i + 1));
-		hsplits[i]->set_split_offset(ofs * EDSCALE);
 	}
+	main_hsplit->set_split_offsets(offsets);
+
 	update_docks_menu();
 }
 
@@ -786,14 +826,15 @@ void EditorDockManager::close_dock(EditorDock *p_dock) {
 		return;
 	}
 
+	p_dock->is_open = false;
+
 	EditorBottomPanel *bottom_panel = EditorNode::get_bottom_panel();
 	if (get_dock_tab_container(p_dock) == bottom_panel && bottom_panel->get_current_tab_control() == p_dock) {
 		bottom_panel->hide_bottom_panel();
 	}
-	_move_dock(p_dock, closed_dock_parent);
-
-	p_dock->is_open = false;
+	// Hide before moving to remove inconsistent signals.
 	p_dock->hide();
+	_move_dock(p_dock, closed_dock_parent);
 
 	_update_layout();
 }
@@ -807,7 +848,6 @@ void EditorDockManager::open_dock(EditorDock *p_dock, bool p_set_current) {
 	}
 
 	p_dock->is_open = true;
-	p_dock->show();
 
 	// Open dock to its previous location.
 	if (p_dock->dock_slot_index != DockConstants::DOCK_SLOT_NONE) {
@@ -825,6 +865,15 @@ void EditorDockManager::open_dock(EditorDock *p_dock, bool p_set_current) {
 	_update_layout();
 }
 
+void EditorDockManager::make_dock_floating(EditorDock *p_dock) {
+	ERR_FAIL_NULL(p_dock);
+	ERR_FAIL_COND_MSG(!all_docks.has(p_dock), vformat("Cannot make unknown dock '%s' floating.", p_dock->get_display_title()));
+
+	if (!p_dock->dock_window) {
+		_open_dock_in_window(p_dock);
+	}
+}
+
 TabContainer *EditorDockManager::get_dock_tab_container(Control *p_dock) const {
 	return Object::cast_to<TabContainer>(p_dock->get_parent());
 }
@@ -838,7 +887,7 @@ void EditorDockManager::focus_dock(EditorDock *p_dock) {
 	}
 
 	if (!p_dock->is_open) {
-		open_dock(p_dock);
+		open_dock(p_dock, false);
 	}
 
 	if (p_dock->dock_window) {
@@ -846,7 +895,11 @@ void EditorDockManager::focus_dock(EditorDock *p_dock) {
 		return;
 	}
 
-	if (!docks_visible) {
+	if (p_dock->get_parent() == EditorNode::get_bottom_panel()) {
+		if (EditorNode::get_bottom_panel()->is_locked()) {
+			return;
+		}
+	} else if (!docks_visible) {
 		return;
 	}
 
@@ -865,8 +918,8 @@ void EditorDockManager::add_dock(EditorDock *p_dock) {
 
 	p_dock->dock_slot_index = p_dock->default_slot;
 	all_docks.push_back(p_dock);
-	p_dock->connect("tab_style_changed", callable_mp(this, &EditorDockManager::_update_tab_style).bind(p_dock));
-	p_dock->connect("renamed", callable_mp(this, &EditorDockManager::_update_tab_style).bind(p_dock));
+	p_dock->connect("_tab_style_changed", callable_mp(this, &EditorDockManager::_queue_update_tab_style).bind(p_dock));
+	p_dock->connect("renamed", callable_mp(this, &EditorDockManager::_queue_update_tab_style).bind(p_dock));
 
 	if (p_dock->default_slot != DockConstants::DOCK_SLOT_NONE) {
 		open_dock(p_dock, false);
@@ -884,8 +937,8 @@ void EditorDockManager::remove_dock(EditorDock *p_dock) {
 	_move_dock(p_dock, nullptr);
 
 	all_docks.erase(p_dock);
-	p_dock->disconnect("tab_style_changed", callable_mp(this, &EditorDockManager::_update_tab_style));
-	p_dock->disconnect("renamed", callable_mp(this, &EditorDockManager::_update_tab_style));
+	p_dock->disconnect("_tab_style_changed", callable_mp(this, &EditorDockManager::_queue_update_tab_style));
+	p_dock->disconnect("renamed", callable_mp(this, &EditorDockManager::_queue_update_tab_style));
 	_update_layout();
 }
 
@@ -894,8 +947,10 @@ void EditorDockManager::set_docks_visible(bool p_show) {
 		return;
 	}
 	docks_visible = p_show;
-	for (int i = 0; i < DockConstants::DOCK_SLOT_MAX; i++) {
-		dock_slots[i].container->set_visible(docks_visible && dock_slots[i].container->get_tab_count() > 0);
+	for (int i = 0; i < DockConstants::DOCK_SLOT_BOTTOM; i++) {
+		// Show and hide in reverse order due to the SplitContainer prioritizing the last split offset.
+		TabContainer *container = dock_slots[docks_visible ? i : DockConstants::DOCK_SLOT_BOTTOM - i - 1].container;
+		container->set_visible(docks_visible && container->get_tab_count() > 0);
 	}
 	_update_layout();
 }
@@ -922,8 +977,8 @@ void EditorDockManager::add_vsplit(DockSplitContainer *p_split) {
 	p_split->connect("dragged", callable_mp(this, &EditorDockManager::_dock_split_dragged));
 }
 
-void EditorDockManager::add_hsplit(DockSplitContainer *p_split) {
-	hsplits.push_back(p_split);
+void EditorDockManager::set_hsplit(DockSplitContainer *p_split) {
+	main_hsplit = p_split;
 	p_split->connect("dragged", callable_mp(this, &EditorDockManager::_dock_split_dragged));
 }
 
@@ -937,6 +992,7 @@ void EditorDockManager::register_dock_slot(DockConstants::DockSlot p_dock_slot, 
 	slot.container = p_tab_container;
 	p_tab_container->set_popup(dock_context_popup);
 	p_tab_container->connect("pre_popup_pressed", callable_mp(dock_context_popup, &DockContextPopup::select_current_dock_in_dock_slot).bind(p_dock_slot));
+	p_tab_container->get_tab_bar()->set_switch_on_release(true);
 	p_tab_container->get_tab_bar()->connect("tab_rmb_clicked", callable_mp(this, &EditorDockManager::_dock_container_popup).bind(p_tab_container));
 	p_tab_container->set_drag_to_rearrange_enabled(true);
 	p_tab_container->set_tabs_rearrange_group(1);
@@ -962,10 +1018,6 @@ void EditorDockManager::register_dock_slot(DockConstants::DockSlot p_dock_slot, 
 	slot.drag_hint->set_slot(p_dock_slot);
 }
 
-int EditorDockManager::get_hsplit_count() const {
-	return hsplits.size();
-}
-
 int EditorDockManager::get_vsplit_count() const {
 	return vsplits.size();
 }
@@ -977,7 +1029,9 @@ PopupMenu *EditorDockManager::get_docks_menu() {
 EditorDockManager::EditorDockManager() {
 	singleton = this;
 
-	closed_dock_parent = EditorNode::get_singleton()->get_gui_base();
+	closed_dock_parent = memnew(Control);
+	closed_dock_parent->hide();
+	EditorNode::get_singleton()->get_gui_base()->add_child(closed_dock_parent);
 
 	dock_context_popup = memnew(DockContextPopup);
 	EditorNode::get_singleton()->get_gui_base()->add_child(dock_context_popup);
@@ -1040,6 +1094,7 @@ void DockContextPopup::_tab_move_right() {
 
 void DockContextPopup::_close_dock() {
 	hide();
+	context_dock->emit_signal("closed");
 	dock_manager->close_dock(context_dock);
 }
 
@@ -1195,7 +1250,7 @@ void DockContextPopup::_dock_select_draw() {
 
 void DockContextPopup::_update_buttons() {
 	TabContainer *context_tab_container = dock_manager->get_dock_tab_container(context_dock);
-	if (context_dock->global) {
+	if (context_dock->global || context_dock->closable) {
 		close_button->set_tooltip_text(TTRC("Close this dock."));
 		close_button->set_disabled(false);
 	} else {
